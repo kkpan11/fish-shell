@@ -20,11 +20,12 @@ use crate::reader::{fish_is_unwinding_for_exit, reader_schedule_prompt_repaint};
 use crate::redirection::RedirectionSpecList;
 use crate::signal::{signal_set_handlers_once, Signal};
 use crate::threads::MainThread;
-use crate::topic_monitor::{topic_monitor_principal, topic_t, GenerationsList};
+use crate::topic_monitor::{topic_monitor_principal, GenerationsList, Topic};
 use crate::wait_handle::{InternalJobId, WaitHandle, WaitHandleRef, WaitHandleStore};
 use crate::wchar::{wstr, WString, L};
 use crate::wchar_ext::ToWString;
 use crate::wutil::{perror, wbasename, wgettext, wperror};
+use fish_printf::sprintf;
 use libc::{
     EBADF, EINVAL, ENOTTY, EPERM, EXIT_SUCCESS, SIGABRT, SIGBUS, SIGCONT, SIGFPE, SIGHUP, SIGILL,
     SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGSYS, SIGTTOU, SIG_DFL, SIG_IGN, STDIN_FILENO,
@@ -32,7 +33,6 @@ use libc::{
     WUNTRACED, _SC_CLK_TCK,
 };
 use once_cell::sync::Lazy;
-use printf::sprintf;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fs;
 use std::io::{Read, Write};
@@ -285,7 +285,7 @@ impl InternalProc {
         assert!(!self.exited(), "Process is already exited");
         self.status.update(status);
         self.exited.store(true, Ordering::Release);
-        topic_monitor_principal().post(topic_t::internal_exit);
+        topic_monitor_principal().post(Topic::internal_exit);
         FLOG!(
             proc_internal_proc,
             "Internal proc",
@@ -984,7 +984,7 @@ impl Job {
             } else {
                 "UNCOMPLETED"
             },
-            if parser.libdata().pods.is_interactive {
+            if parser.libdata().is_interactive {
                 "INTERACTIVE"
             } else {
                 "NON-INTERACTIVE"
@@ -1003,7 +1003,7 @@ impl Job {
             if p.status.normal_exited() || p.status.signal_exited() {
                 if let Some(statuses) = self.get_statuses() {
                     parser.set_last_statuses(statuses);
-                    parser.libdata_mut().pods.status_count += 1;
+                    parser.libdata_mut().status_count += 1;
                 }
             }
         }
@@ -1290,7 +1290,7 @@ fn handle_child_status(job: &Job, proc: &Process, status: &ProcStatus) {
 /// Wait for any process finishing, or receipt of a signal.
 pub fn proc_wait_any(parser: &Parser) {
     process_mark_finished_children(parser, true /*block_ok*/);
-    let is_interactive = parser.libdata().pods.is_interactive;
+    let is_interactive = parser.libdata().is_interactive;
     process_clean_after_marking(parser, is_interactive);
 }
 
@@ -1382,13 +1382,13 @@ fn process_mark_finished_children(parser: &Parser, block_ok: bool) {
 
             if proc.has_pid() {
                 // Reaps with a pid.
-                reapgens.set_min_from(topic_t::sigchld, &proc.gens);
-                reapgens.set_min_from(topic_t::sighupint, &proc.gens);
+                reapgens.set_min_from(Topic::sigchld, &proc.gens);
+                reapgens.set_min_from(Topic::sighupint, &proc.gens);
             }
             if proc.internal_proc.borrow().is_some() {
                 // Reaps with an internal process.
-                reapgens.set_min_from(topic_t::internal_exit, &proc.gens);
-                reapgens.set_min_from(topic_t::sighupint, &proc.gens);
+                reapgens.set_min_from(Topic::internal_exit, &proc.gens);
+                reapgens.set_min_from(Topic::sighupint, &proc.gens);
             }
         }
     }
@@ -1705,12 +1705,12 @@ fn process_clean_after_marking(parser: &Parser, allow_interactive: bool) -> bool
 
     // This function may fire an event handler, we do not want to call ourselves recursively (to
     // avoid infinite recursion).
-    if parser.libdata().pods.is_cleaning_procs {
+    if parser.libdata().is_cleaning_procs {
         return false;
     }
 
     let _cleaning = scoped_push_replacer(
-        |new_value| std::mem::replace(&mut parser.libdata_mut().pods.is_cleaning_procs, new_value),
+        |new_value| std::mem::replace(&mut parser.libdata_mut().is_cleaning_procs, new_value),
         true,
     );
 
