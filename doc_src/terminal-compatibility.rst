@@ -120,9 +120,21 @@ Optional Commands
      - smul
      - Enter underline mode.
      -
+   * - ``\e[4:2m``
+     - Su
+     - Enter double underline mode.
+     - kitty
    * - ``\e[4:3m``
      - Su
      - Enter curly underline mode.
+     - kitty
+   * - ``\e[4:4m``
+     - Su
+     - Enter dotted underline mode.
+     - kitty
+   * - ``\e[4:5m``
+     - Su
+     - Enter dashed underline mode.
      - kitty
    * - ``\e[7m``
      - rev
@@ -165,13 +177,17 @@ Optional Commands
      -
      - Select background color from 24-bit RGB colors.
      -
+   * - ``\e[49m``
+     -
+     - Reset background color to the terminal's default.
+     -
    * - ``\e[58:2:: Ps : Ps : Ps m`` (note: colons not semicolons)
      - Su
      - Select underline color from 24-bit RGB colors.
      - kitty
    * - ``\e[59m``
      - Su
-     - Reset underline color (follow foreground color).
+     - Reset underline color to the default (follow the foreground color).
      - kitty
    * - ``\e[ Ps S``
      - indn
@@ -207,7 +223,7 @@ Optional Commands
      - Disable mouse reporting.
      - XTerm
    * - ``\e[?1004h``
-     - f/a
+     - n/a
      - Enable focus reporting.
      -
    * - ``\e[?1004l``
@@ -230,14 +246,6 @@ Optional Commands
      -
      - Disable bracketed paste.
      - XTerm
-   * - ``\e[?2026h``
-     -
-     - Begin synchronized output.
-     - contour
-   * - ``\e[?2026l``
-     -
-     - End synchronized output.
-     - contour
    * - ``\e]0; Pt \x07``
      - ts
      - Set window title (OSC 0).
