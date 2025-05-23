@@ -20,15 +20,20 @@ use libc::{
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use once_cell::sync::Lazy;
+use once_cell::unsync::OnceCell;
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU64;
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::cell::RefMut;
 use std::cell::UnsafeCell;
 use std::cmp;
 use std::io::BufReader;
+use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::ops::Range;
+use std::os::fd::BorrowedFd;
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -42,7 +47,7 @@ use std::time::{Duration, Instant};
 use errno::{errno, Errno};
 
 use crate::abbrs::abbrs_match;
-use crate::ast::{is_same_node, Ast, Category};
+use crate::ast::{self, is_same_node, Kind};
 use crate::builtins::shared::ErrorCode;
 use crate::builtins::shared::STATUS_CMD_ERROR;
 use crate::builtins::shared::STATUS_CMD_OK;
@@ -78,13 +83,12 @@ use crate::history::{
     SearchType,
 };
 use crate::input::init_input;
+use crate::input_common::stop_query;
 use crate::input_common::terminal_protocols_disable_ifn;
-use crate::input_common::unblock_input;
-use crate::input_common::BlockingWait;
-use crate::input_common::CursorPositionWait;
+use crate::input_common::CursorPositionQuery;
 use crate::input_common::ImplicitEvent;
-use crate::input_common::InputEventQueuer;
-use crate::input_common::Queried;
+use crate::input_common::QueryResponseEvent;
+use crate::input_common::TerminalQuery;
 use crate::input_common::IN_DVTM;
 use crate::input_common::IN_MIDNIGHT_COMMANDER;
 use crate::input_common::{
@@ -126,20 +130,14 @@ use crate::signal::{
 use crate::terminal::BufferedOutputter;
 use crate::terminal::Output;
 use crate::terminal::Outputter;
-use crate::terminal::TerminalCommand::DecrstAlternateScreenBuffer;
-use crate::terminal::TerminalCommand::DecrstMouseTracking;
-use crate::terminal::TerminalCommand::DecrstSynchronizedUpdate;
-use crate::terminal::TerminalCommand::DecsetAlternateScreenBuffer;
-use crate::terminal::TerminalCommand::DecsetShowCursor;
-use crate::terminal::TerminalCommand::DecsetSynchronizedUpdate;
-use crate::terminal::TerminalCommand::QueryCursorPosition;
 use crate::terminal::TerminalCommand::{
-    ClearScreen, Osc0WindowTitle, Osc133CommandStart, QueryKittyKeyboardProgressiveEnhancements,
-    QueryPrimaryDeviceAttribute, QuerySynchronizedOutput, QueryXtgettcap, QueryXtversion,
+    ClearScreen, DecrstAlternateScreenBuffer, DecrstMouseTracking, DecsetAlternateScreenBuffer,
+    DecsetShowCursor, Osc0WindowTitle, Osc133CommandFinished, Osc133CommandStart,
+    QueryCursorPosition, QueryKittyKeyboardProgressiveEnhancements, QueryPrimaryDeviceAttribute,
+    QueryXtgettcap, QueryXtversion,
 };
 use crate::terminal::{
     Capability, KITTY_KEYBOARD_SUPPORTED, SCROLL_FORWARD_SUPPORTED, SCROLL_FORWARD_TERMINFO_CODE,
-    SYNCHRONIZED_OUTPUT_SUPPORTED,
 };
 use crate::termsize::{termsize_invalidate_tty, termsize_last, termsize_update};
 use crate::text_face::parse_text_face;
@@ -237,6 +235,28 @@ fn redirect_tty_after_sighup() {
     if !TTY_REDIRECTED.swap(true) {
         redirect_tty_output(false);
     }
+}
+
+pub(crate) fn initial_query(
+    blocking_query: &OnceCell<RefCell<Option<TerminalQuery>>>,
+    out: &mut impl Output,
+    vars: Option<&dyn Environment>,
+) {
+    blocking_query.get_or_init(|| {
+        let query = if is_dumb() || IN_MIDNIGHT_COMMANDER.load() || IN_DVTM.load() {
+            None
+        } else {
+            // Query for kitty keyboard protocol support.
+            out.write_command(QueryKittyKeyboardProgressiveEnhancements);
+            out.write_command(QueryXtversion);
+            if let Some(vars) = vars {
+                query_capabilities_via_dcs(out.by_ref(), vars);
+            }
+            out.write_command(QueryPrimaryDeviceAttribute);
+            Some(TerminalQuery::PrimaryDeviceAttribute)
+        };
+        RefCell::new(query)
+    });
 }
 
 /// The stack of current interactive reading contexts.
@@ -546,8 +566,6 @@ pub struct ReaderData {
     /// The representation of the current screen contents.
     screen: Screen,
 
-    pub blocking_wait: Rc<Mutex<Option<BlockingWait>>>,
-
     /// Data associated with input events.
     /// This is made public so that InputEventQueuer can be implemented on us.
     pub input_data: InputData,
@@ -639,10 +657,11 @@ pub fn reader_read(parser: &Parser, fd: RawFd, io: &IoChain) -> Result<(), Error
     // See also, commit 396bf12. Without the need for this workaround we would just write:
     // int inter = ((fd == STDIN_FILENO) && isatty(STDIN_FILENO));
     if fd == STDIN_FILENO {
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        let mut t = MaybeUninit::uninit();
         if isatty(STDIN_FILENO) {
             interactive = true;
-        } else if unsafe { libc::tcgetattr(STDIN_FILENO, &mut t) } == -1 && errno().0 == EIO {
+        } else if unsafe { libc::tcgetattr(STDIN_FILENO, t.as_mut_ptr()) } == -1 && errno().0 == EIO
+        {
             redirect_tty_output(false);
             interactive = true;
         }
@@ -713,9 +732,8 @@ fn read_i(parser: &Parser) {
         data.exit_loop_requested |= parser.libdata().exit_current_script;
         parser.libdata_mut().exit_current_script = false;
 
-        BufferedOutputter::new(Outputter::stdoutput()).write_command(
-            crate::terminal::TerminalCommand::Osc133CommandFinished(parser.get_last_status()),
-        );
+        BufferedOutputter::new(Outputter::stdoutput())
+            .write_command(Osc133CommandFinished(parser.get_last_status()));
         event::fire_generic(parser, L!("fish_postexec").to_owned(), vec![command]);
         // Allow any pending history items to be returned in the history array.
         data.history.resolve_pending();
@@ -782,7 +800,7 @@ fn read_ni(parser: &Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
     loop {
         let mut buff = [0_u8; 4096];
 
-        match nix::unistd::read(fd, &mut buff) {
+        match nix::unistd::read(unsafe { BorrowedFd::borrow_raw(fd) }, &mut buff) {
             Ok(0) => {
                 // EOF.
                 break;
@@ -1182,10 +1200,6 @@ fn reader_received_sighup() -> bool {
 
 impl ReaderData {
     fn new(history: Arc<History>, conf: ReaderConfig) -> Pin<Box<Self>> {
-        let blocking_wait = reader_current_data().map_or_else(
-            || Rc::new(Mutex::new(Some(BlockingWait::Startup(Queried::NotYet)))),
-            |parent| parent.blocking_wait.clone(),
-        );
         let input_data = InputData::new(conf.inputfd);
         Pin::new(Box::new(Self {
             canary: Rc::new(()),
@@ -1203,7 +1217,6 @@ impl ReaderData {
             last_flash: Default::default(),
             flash_autosuggestion: false,
             screen: Screen::new(),
-            blocking_wait,
             input_data,
             queued_repaint: false,
             history,
@@ -1228,10 +1241,6 @@ impl ReaderData {
             in_flight_autosuggest_request: Default::default(),
             rls: None,
         }))
-    }
-
-    pub(crate) fn blocking_wait(&self) -> MutexGuard<Option<BlockingWait>> {
-        self.blocking_wait.lock().unwrap()
     }
 
     // We repaint our prompt if fstat reports the tty as having changed.
@@ -1439,20 +1448,6 @@ impl ReaderData {
         true
     }
 
-    pub fn request_cursor_position(
-        &mut self,
-        out: &mut Outputter,
-        wait: Option<CursorPositionWait>,
-    ) {
-        if let Some(cursor_position_wait) = wait {
-            let mut wait_guard = self.blocking_wait();
-            assert!(wait_guard.is_none());
-            *wait_guard = Some(BlockingWait::CursorPosition(cursor_position_wait));
-        }
-        out.write_command(QueryCursorPosition);
-        self.save_screen_state();
-    }
-
     pub fn mouse_left_click(&mut self, cursor: ViewportPosition, click_position: ViewportPosition) {
         FLOG!(
             reader,
@@ -1526,6 +1521,19 @@ pub fn combine_command_and_autosuggestion(
 }
 
 impl<'a> Reader<'a> {
+    pub(crate) fn blocking_query(&self) -> RefMut<'_, Option<TerminalQuery>> {
+        self.parser.blocking_query.get().unwrap().borrow_mut()
+    }
+
+    pub fn request_cursor_position(&mut self, out: &mut Outputter, q: CursorPositionQuery) {
+        let mut query = self.blocking_query();
+        assert!(query.is_none());
+        *query = Some(TerminalQuery::CursorPositionReport(q));
+        out.write_command(QueryCursorPosition);
+        drop(query);
+        self.save_screen_state();
+    }
+
     /// Return true if the command line has changed and repainting is needed. If `colors` is not
     /// null, then also return true if the colors have changed.
     fn is_repaint_needed(&self, mcolors: Option<&[HighlightSpec]>) -> bool {
@@ -2174,8 +2182,10 @@ impl<'a> Reader<'a> {
         unsafe { libc::tcsetpgrp(self.conf.inputfd, libc::getpgrp()) };
 
         // Get the current terminal modes. These will be restored when the function returns.
-        let mut old_modes: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(self.conf.inputfd, &mut old_modes) } == -1 && errno().0 == EIO {
+        let mut old_modes = MaybeUninit::uninit();
+        if unsafe { libc::tcgetattr(self.conf.inputfd, old_modes.as_mut_ptr()) } == -1
+            && errno().0 == EIO
+        {
             redirect_tty_output(false);
         }
 
@@ -2194,24 +2204,11 @@ impl<'a> Reader<'a> {
             }
         }
 
-        if *self.blocking_wait() == Some(BlockingWait::Startup(Queried::NotYet)) {
-            if is_dumb() || IN_MIDNIGHT_COMMANDER.load() || IN_DVTM.load() {
-                *self.blocking_wait() = None;
-            } else {
-                *self.blocking_wait() = Some(BlockingWait::Startup(Queried::Once));
-                let mut out = Outputter::stdoutput().borrow_mut();
-                out.begin_buffering();
-                // Query for kitty keyboard protocol support.
-                out.write_command(QueryKittyKeyboardProgressiveEnhancements);
-                // Query for cursor position reporting support.
-                self.request_cursor_position(&mut out, None);
-                // Query for synchronized output support.
-                out.write_command(QuerySynchronizedOutput);
-                out.write_command(QueryXtversion);
-                out.write_command(QueryPrimaryDeviceAttribute);
-                out.end_buffering();
-            }
-        }
+        initial_query(
+            &self.parser.blocking_query,
+            &mut BufferedOutputter::new(Outputter::stdoutput()),
+            Some(self.parser.vars()),
+        );
 
         // HACK: Don't abandon line for the first prompt, because
         // if we're started with the terminal it might not have settled,
@@ -2282,7 +2279,7 @@ impl<'a> Reader<'a> {
         if EXIT_STATE.load(Ordering::Relaxed) != ExitState::FinishedHandlers as _ {
             // The order of the two conditions below is important. Try to restore the mode
             // in all cases, but only complain if interactive.
-            if unsafe { libc::tcsetattr(self.conf.inputfd, TCSANOW, &old_modes) } == -1
+            if unsafe { libc::tcsetattr(self.conf.inputfd, TCSANOW, old_modes.as_ptr()) } == -1
                 && is_interactive_session()
             {
                 if errno().0 == EIO {
@@ -2528,50 +2525,48 @@ impl<'a> Reader<'a> {
                         .write_command(DecrstMouseTracking);
                     self.save_screen_state();
                 }
-                ImplicitEvent::PrimaryDeviceAttribute => {
-                    let mut wait_guard = self.blocking_wait();
-                    let Some(wait) = &*wait_guard else {
-                        // Rogue reply.
-                        return ControlFlow::Continue(());
-                    };
-                    let BlockingWait::Startup(stage) = wait else {
-                        // Rogue reply.
-                        return ControlFlow::Continue(());
-                    };
-                    match stage {
-                        Queried::NotYet => panic!(),
-                        Queried::Once => {
-                            if KITTY_KEYBOARD_SUPPORTED.load(Ordering::Relaxed)
-                                == Capability::Unknown as _
-                            {
-                                KITTY_KEYBOARD_SUPPORTED
-                                    .store(Capability::NotSupported as _, Ordering::Release);
-                            }
-                            if SYNCHRONIZED_OUTPUT_SUPPORTED.load() {
-                                let mut out = Outputter::stdoutput().borrow_mut();
-                                out.begin_buffering();
-                                query_capabilities_via_dcs(out.by_ref());
-                                out.write_command(QueryPrimaryDeviceAttribute);
-                                out.end_buffering();
-                                *wait_guard = Some(BlockingWait::Startup(Queried::Twice));
-                                drop(wait_guard);
-                                self.save_screen_state();
-                                return ControlFlow::Continue(());
-                            }
-                        }
-                        Queried::Twice => (),
-                    }
-                    unblock_input(wait_guard);
-                }
-                ImplicitEvent::MouseLeftClickContinuation(cursor, click_position) => {
-                    self.mouse_left_click(cursor, click_position);
-                    unblock_input(self.blocking_wait());
-                }
-                ImplicitEvent::ScrollbackPushContinuation(cursor_y) => {
-                    self.screen.push_to_scrollback(cursor_y);
-                    unblock_input(self.blocking_wait());
+                ImplicitEvent::MouseLeft(position) => {
+                    FLOG!(reader, "Mouse left click", position);
+                    self.request_cursor_position(
+                        &mut Outputter::stdoutput().borrow_mut(),
+                        CursorPositionQuery::MouseLeft(position),
+                    );
                 }
             },
+            CharEvent::QueryResponse(query_response) => {
+                match query_response {
+                    QueryResponseEvent::PrimaryDeviceAttribute => {
+                        if *self.blocking_query() != Some(TerminalQuery::PrimaryDeviceAttribute) {
+                            // Rogue reply.
+                            return ControlFlow::Continue(());
+                        }
+                        if KITTY_KEYBOARD_SUPPORTED.load(Ordering::Relaxed)
+                            == Capability::Unknown as _
+                        {
+                            KITTY_KEYBOARD_SUPPORTED
+                                .store(Capability::NotSupported as _, Ordering::Release);
+                        }
+                    }
+                    QueryResponseEvent::CursorPositionReport(cursor_pos) => {
+                        let cursor_pos_query = match &*self.blocking_query() {
+                            Some(TerminalQuery::CursorPositionReport(cursor_pos_query)) => {
+                                cursor_pos_query.clone()
+                            }
+                            _ => return ControlFlow::Continue(()), // Rogue reply.
+                        };
+                        match cursor_pos_query {
+                            CursorPositionQuery::MouseLeft(click_position) => {
+                                self.mouse_left_click(cursor_pos, click_position);
+                            }
+                            CursorPositionQuery::ScrollbackPush => {
+                                self.screen.push_to_scrollback(cursor_pos.y);
+                            }
+                        }
+                    }
+                }
+                let ok = stop_query(self.blocking_query());
+                assert!(ok);
+            }
         }
         ControlFlow::Continue(())
     }
@@ -2589,12 +2584,18 @@ fn send_xtgettcap_query(out: &mut impl Output, cap: &'static str) {
     out.write_command(QueryXtgettcap(cap));
 }
 
-fn query_capabilities_via_dcs(out: &mut impl Output) {
-    out.write_command(DecsetSynchronizedUpdate); // begin synchronized update
+fn query_capabilities_via_dcs(out: &mut impl Output, vars: &dyn Environment) {
+    if vars.get_unless_empty(L!("STY")).is_some()
+        || vars.get_unless_empty(L!("TERM")).is_some_and(|term| {
+            let term = &term.as_list()[0];
+            term == "screen" || term == "screen-256color"
+        })
+    {
+        return;
+    }
     out.write_command(DecsetAlternateScreenBuffer); // enable alternative screen buffer
     send_xtgettcap_query(out, SCROLL_FORWARD_TERMINFO_CODE);
     out.write_command(DecrstAlternateScreenBuffer); // disable alternative screen buffer
-    out.write_command(DecrstSynchronizedUpdate); // end synchronized update
 }
 
 impl<'a> Reader<'a> {
@@ -3822,18 +3823,18 @@ impl<'a> Reader<'a> {
                 if !SCROLL_FORWARD_SUPPORTED.load() {
                     return;
                 }
-                let wait_guard = self.blocking_wait();
-                let Some(wait) = &*wait_guard else {
-                    drop(wait_guard);
+                let query = self.blocking_query();
+                let Some(query) = &*query else {
+                    drop(query);
                     self.request_cursor_position(
                         &mut Outputter::stdoutput().borrow_mut(),
-                        Some(CursorPositionWait::ScrollbackPush),
+                        CursorPositionQuery::ScrollbackPush,
                     );
                     return;
                 };
-                match wait {
-                    BlockingWait::Startup(_) => panic!(),
-                    BlockingWait::CursorPosition(_) => {
+                match query {
+                    TerminalQuery::PrimaryDeviceAttribute => panic!(),
+                    TerminalQuery::CursorPositionReport(_) => {
                         // TODO: re-queue it I guess.
                         FLOG!(
                             reader,
@@ -4262,10 +4263,10 @@ fn term_donate(quiet: bool /* = false */) {
 
 /// Copy the (potentially changed) terminal modes and use them from now on.
 pub fn term_copy_modes() {
-    let mut modes: libc::termios = unsafe { std::mem::zeroed() };
-    unsafe { libc::tcgetattr(STDIN_FILENO, &mut modes) };
+    let mut modes = MaybeUninit::uninit();
+    unsafe { libc::tcgetattr(STDIN_FILENO, modes.as_mut_ptr()) };
     let mut tty_modes_for_external_cmds = TTY_MODES_FOR_EXTERNAL_CMDS.lock().unwrap();
-    *tty_modes_for_external_cmds = modes;
+    *tty_modes_for_external_cmds = unsafe { modes.assume_init() };
     // We still want to fix most egregious breakage.
     // E.g. OPOST is *not* something that should be set globally,
     // and 99% triggered by a crashed program.
@@ -5343,15 +5344,15 @@ fn extract_tokens(s: &wstr) -> Vec<PositionedToken> {
     let ast_flags = ParseTreeFlags::CONTINUE_AFTER_ERROR
         | ParseTreeFlags::ACCEPT_INCOMPLETE_TOKENS
         | ParseTreeFlags::LEAVE_UNTERMINATED;
-    let ast = Ast::parse(s, ast_flags, None);
+    let ast = ast::parse(s, ast_flags, None);
 
     let mut result = vec![];
     let mut traversal = ast.walk();
     while let Some(node) = traversal.next() {
         // We are only interested in leaf nodes with source.
-        if node.category() != Category::leaf {
+        if node.as_leaf().is_none() {
             continue;
-        }
+        };
         let range = node.source_range();
         if range.length() == 0 {
             continue;
@@ -5385,10 +5386,10 @@ fn extract_tokens(s: &wstr) -> Vec<PositionedToken> {
         if !has_cmd_subs {
             // Common case of no command substitutions in this leaf node.
             // Check if a node is the command portion of a decorated statement.
-            let is_cmd = traversal
-                .parent(node)
-                .as_decorated_statement()
-                .is_some_and(|stmt| is_same_node(node, &stmt.command));
+            let mut is_cmd = false;
+            if let Kind::DecoratedStatement(stmt) = traversal.parent(node).kind() {
+                is_cmd = is_same_node(node, &stmt.command);
+            }
             result.push(PositionedToken { range, is_cmd })
         }
     }

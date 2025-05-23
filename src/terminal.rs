@@ -55,12 +55,11 @@ pub(crate) enum TerminalCommand<'a> {
     EnterBoldMode,
     EnterDimMode,
     EnterItalicsMode,
-    EnterUnderlineMode,
+    EnterUnderlineMode(UnderlineStyle),
     EnterReverseMode,
     EnterStandoutMode,
     ExitItalicsMode,
     ExitUnderlineMode,
-    EnterCurlyUnderlineMode,
 
     // Screen clearing
     ClearScreen,
@@ -70,6 +69,7 @@ pub(crate) enum TerminalCommand<'a> {
     // Colors
     SelectPaletteColor(Paintable, u8),
     SelectRgbColor(Paintable, Color24),
+    DefaultBackgroundColor,
     DefaultUnderlineColor,
 
     // Cursor Movement
@@ -86,10 +86,6 @@ pub(crate) enum TerminalCommand<'a> {
 
     DecsetAlternateScreenBuffer,
     DecrstAlternateScreenBuffer,
-    DecsetSynchronizedUpdate,
-    DecrstSynchronizedUpdate,
-
-    QuerySynchronizedOutput,
 
     // Keyboard protocols
     KittyKeyboardProgressiveEnhancementsEnable,
@@ -152,17 +148,17 @@ pub(crate) trait Output {
             EnterBoldMode => ti(self, b"\x1b[1m", |t| &t.enter_bold_mode),
             EnterDimMode => ti(self, b"\x1b[2m", |t| &t.enter_dim_mode),
             EnterItalicsMode => ti(self, b"\x1b[3m", |t| &t.enter_italics_mode),
-            EnterUnderlineMode => ti(self, b"\x1b[4m", |t| &t.enter_underline_mode),
+            EnterUnderlineMode(style) => underline_mode(self, style),
             EnterReverseMode => ti(self, b"\x1b[7m", |t| &t.enter_reverse_mode),
             EnterStandoutMode => ti(self, b"\x1b[7m", |t| &t.enter_standout_mode),
             ExitItalicsMode => ti(self, b"\x1b[23m", |t| &t.exit_italics_mode),
             ExitUnderlineMode => ti(self, b"\x1b[24m", |t| &t.exit_underline_mode),
-            EnterCurlyUnderlineMode => write(self, b"\x1b[4:3m"),
             ClearScreen => ti(self, b"\x1b[H\x1b[2J", |term| &term.clear_screen),
             ClearToEndOfLine => ti(self, b"\x1b[K", |term| &term.clr_eol),
             ClearToEndOfScreen => ti(self, b"\x1b[J", |term| &term.clr_eos),
             SelectPaletteColor(paintable, idx) => palette_color(self, paintable, idx),
             SelectRgbColor(paintable, rgb) => rgb_color(self, paintable, rgb),
+            DefaultBackgroundColor => write(self, b"\x1b[49m"),
             DefaultUnderlineColor => write(self, b"\x1b[59m"),
             CursorUp => ti(self, b"\x1b[A", |term| &term.cursor_up),
             CursorDown => ti(self, b"\n", |term| &term.cursor_down),
@@ -174,9 +170,6 @@ pub(crate) trait Output {
             QueryXtgettcap(cap) => query_xtgettcap(self, cap),
             DecsetAlternateScreenBuffer => write(self, b"\x1b[?1049h"),
             DecrstAlternateScreenBuffer => write(self, b"\x1b[?1049l"),
-            DecsetSynchronizedUpdate => write(self, b"\x1b[?2026h"),
-            DecrstSynchronizedUpdate => write(self, b"\x1b[?2026l"),
-            QuerySynchronizedOutput => write(self, b"\x1b[?2026$p"),
             KittyKeyboardProgressiveEnhancementsEnable => write(self, b"\x1b[=5u"),
             KittyKeyboardProgressiveEnhancementsDisable => write(self, b"\x1b[=0u"),
             QueryKittyKeyboardProgressiveEnhancements => query_kitty_progressive_enhancements(self),
@@ -235,10 +228,21 @@ pub(crate) static KITTY_KEYBOARD_SUPPORTED: AtomicU8 = AtomicU8::new(Capability:
 pub(crate) static SCROLL_FORWARD_SUPPORTED: RelaxedAtomicBool = RelaxedAtomicBool::new(false);
 pub(crate) static SCROLL_FORWARD_TERMINFO_CODE: &str = "indn";
 
-pub(crate) static SYNCHRONIZED_OUTPUT_SUPPORTED: RelaxedAtomicBool = RelaxedAtomicBool::new(false);
-
 pub(crate) fn use_terminfo() -> bool {
     !future_feature_flags::test(FeatureFlag::ignore_terminfo) && TERM.lock().unwrap().is_some()
+}
+
+fn underline_mode(out: &mut impl Output, style: UnderlineStyle) -> bool {
+    use UnderlineStyle as UL;
+    let style = match style {
+        UL::Single => return maybe_terminfo(out, b"\x1b[4m", |t| &t.enter_underline_mode),
+        UL::Double => 2,
+        UL::Curly => 3,
+        UL::Dotted => 4,
+        UL::Dashed => 5,
+    };
+    write_to_output!(out, "\x1b[4:{}m", style);
+    true
 }
 
 fn palette_color(out: &mut impl Output, paintable: Paintable, mut idx: u8) -> bool {
@@ -451,6 +455,14 @@ impl Outputter {
         Self::new_from_fd(-1)
     }
 
+    pub fn new_buffering_no_assume_normal() -> Self {
+        let mut zelf = Self::new_buffering();
+        zelf.last.fg = Color::None;
+        zelf.last.bg = Color::None;
+        assert_eq!(zelf.last.underline_color, Color::None);
+        zelf
+    }
+
     fn maybe_flush(&mut self) {
         if self.fd >= 0 && self.buffer_count == 0 {
             self.flush_to(self.fd);
@@ -501,17 +513,20 @@ impl Outputter {
     ///
     /// - Lastly we may need to write set_a_background or set_a_foreground to set the other half of the
     /// color pair to what it should be.
-    #[allow(clippy::if_same_then_else)]
     pub(crate) fn set_text_face(&mut self, face: TextFace) {
+        self.set_text_face_internal(face, true)
+    }
+    pub(crate) fn set_text_face_no_magic(&mut self, face: TextFace) {
+        self.set_text_face_internal(face, false)
+    }
+    fn set_text_face_internal(&mut self, face: TextFace, salvage_unreadable: bool) {
         let mut fg = face.fg;
         let bg = face.bg;
         let underline_color = face.underline_color;
         let style = face.style;
-        let mut bg_set = false;
-        let mut last_bg_set = false;
 
         use TerminalCommand::{
-            DefaultUnderlineColor, EnterBoldMode, EnterCurlyUnderlineMode, EnterDimMode,
+            DefaultBackgroundColor, DefaultUnderlineColor, EnterBoldMode, EnterDimMode,
             EnterItalicsMode, EnterReverseMode, EnterStandoutMode, EnterUnderlineMode,
             ExitAttributeMode, ExitItalicsMode, ExitUnderlineMode,
         };
@@ -528,32 +543,14 @@ impl Outputter {
             // Only way to exit non-resettable ones is a reset of all attributes.
             self.reset_text_face();
         }
-        if !self.last.bg.is_special() {
-            // Background was set.
-            // "Special" here refers to the special "normal" and "none" colors,
-            // that really just disable the background.
-            last_bg_set = true;
-        }
-        if !bg.is_special() {
-            // Background is set.
-            bg_set = true;
-            if fg == bg {
+        if salvage_unreadable {
+            if !bg.is_special() && fg == bg {
                 fg = if bg == Color::WHITE {
                     Color::BLACK
                 } else {
                     Color::WHITE
                 };
             }
-        }
-
-        if bg_set && !last_bg_set {
-            // Background color changed and is set, so we enter bold mode to make reading easier.
-            // This means bold mode is _always_ on when the background color is set.
-            self.write_command(EnterBoldMode);
-        }
-        if !bg_set && last_bg_set {
-            // Background color changed and is no longer set, so we exit bold mode.
-            self.reset_text_face();
         }
 
         if !fg.is_none() && fg != self.last.fg {
@@ -572,14 +569,7 @@ impl Outputter {
 
         if !bg.is_none() && bg != self.last.bg {
             if bg.is_normal() {
-                self.write_command(ExitAttributeMode);
-                if !self.last.fg.is_normal() {
-                    self.write_color(Paintable::Foreground, self.last.fg);
-                }
-                if !self.last.underline_color.is_normal() && !self.last.underline_color.is_none() {
-                    self.write_color(Paintable::Underline, self.last.underline_color);
-                }
-                self.last.style = TextStyling::default();
+                self.write_command(DefaultBackgroundColor);
             } else {
                 assert!(!bg.is_special());
                 self.write_color(Paintable::Background, bg);
@@ -597,11 +587,7 @@ impl Outputter {
         }
 
         // Lastly, we set bold, underline, italics, dim, and reverse modes correctly.
-        if style.is_bold()
-            && !self.last.style.is_bold()
-            && !bg_set
-            && self.write_command(EnterBoldMode)
-        {
+        if style.is_bold() && !self.last.style.is_bold() && self.write_command(EnterBoldMode) {
             self.last.style.bold = true;
         }
 
@@ -612,12 +598,9 @@ impl Outputter {
                         self.last.style.underline_style = None;
                     }
                 }
-                Some(underline) => {
-                    if self.write_command(match underline {
-                        UnderlineStyle::Single => EnterUnderlineMode,
-                        UnderlineStyle::Curly => EnterCurlyUnderlineMode,
-                    }) {
-                        self.last.style.underline_style = Some(underline);
+                Some(underline_style) => {
+                    if self.write_command(EnterUnderlineMode(underline_style)) {
+                        self.last.style.underline_style = Some(underline_style);
                     }
                 }
             }

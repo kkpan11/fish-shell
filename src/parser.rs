@@ -1,6 +1,6 @@
 // The fish parser. Contains functions for parsing and evaluating code.
 
-use crate::ast::{self, Ast, List, Node};
+use crate::ast::{self, Node};
 use crate::builtins::shared::STATUS_ILLEGAL_CMD;
 use crate::common::{
     escape_string, wcs2string, CancelChecker, EscapeFlags, EscapeStringStyle, FilenameRef,
@@ -14,7 +14,7 @@ use crate::expand::{
 };
 use crate::fds::{open_dir, BEST_O_SEARCH};
 use crate::global_safety::RelaxedAtomicBool;
-use crate::input_common::terminal_protocols_disable_ifn;
+use crate::input_common::{terminal_protocols_disable_ifn, TerminalQuery};
 use crate::io::IoChain;
 use crate::job_group::MaybeJobId;
 use crate::operation_context::{OperationContext, EXPANSION_LIMIT_DEFAULT};
@@ -30,9 +30,11 @@ use crate::threads::assert_is_main_thread;
 use crate::util::get_time;
 use crate::wait_handle::WaitHandleStore;
 use crate::wchar::{wstr, WString, L};
+use crate::wchar_ext::WExt;
 use crate::wutil::{perror, wgettext, wgettext_fmt};
 use crate::{function, FLOG};
 use libc::c_int;
+use once_cell::unsync::OnceCell;
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU64;
 use std::cell::{Ref, RefCell, RefMut};
@@ -439,6 +441,8 @@ pub struct Parser {
 
     /// Global event blocks.
     pub global_event_blocks: AtomicU64,
+
+    pub blocking_query: OnceCell<RefCell<Option<TerminalQuery>>>,
 }
 
 impl Parser {
@@ -456,6 +460,7 @@ impl Parser {
             cancel_behavior,
             profile_items: RefCell::default(),
             global_event_blocks: AtomicU64::new(0),
+            blocking_query: OnceCell::new(),
         };
 
         match open_dir(CStr::from_bytes_with_nul(b".\0").unwrap(), BEST_O_SEARCH) {
@@ -552,7 +557,7 @@ impl Parser {
         block_type: BlockType,
     ) -> EvalRes {
         assert!([BlockType::top, BlockType::subst].contains(&block_type));
-        let job_list = ps.ast.top().as_job_list().unwrap();
+        let job_list = ps.ast.top();
         if !job_list.is_empty() {
             // Execute the top job list.
             self.eval_node(ps, job_list, io, job_group, block_type)
@@ -577,7 +582,7 @@ impl Parser {
         use crate::parse_tree::ParsedSource;
         use crate::parse_util::parse_util_detect_errors_in_ast;
         let mut errors = vec![];
-        let ast = Ast::parse(&src, ParseTreeFlags::empty(), Some(&mut errors));
+        let ast = ast::parse(&src, ParseTreeFlags::empty(), Some(&mut errors));
         let mut errored = ast.errored();
         if !errored {
             errored = parse_util_detect_errors_in_ast(&ast, &src, Some(&mut errors)).is_err();
@@ -722,7 +727,7 @@ impl Parser {
         ctx: &OperationContext<'_>,
     ) -> CompletionList {
         // Parse the string as an argument list.
-        let ast = Ast::parse_argument_list(arg_list_src, ParseTreeFlags::default(), None);
+        let ast = ast::parse_argument_list(arg_list_src, ParseTreeFlags::default(), None);
         if ast.errored() {
             // Failed to parse. Here we expect to have reported any errors in test_args.
             return vec![];
@@ -730,8 +735,7 @@ impl Parser {
 
         // Get the root argument list and extract arguments from it.
         let mut result = vec![];
-        let list = ast.top().as_freestanding_argument_list().unwrap();
-        for arg in &list.arguments {
+        for arg in &ast.top().arguments {
             let arg_src = arg.source(arg_list_src);
             if matches!(
                 expand_string(arg_src.to_owned(), &mut result, flags, ctx, None).result,
@@ -1064,7 +1068,7 @@ impl Parser {
 
     /// Returns a new profile item if profiling is active. The caller should fill it in.
     /// The Parser will deallocate it.
-    /// If profiling is not active, this returns nullptr.
+    /// If profiling is not active, this returns None.
     pub fn create_profile_item(&self) -> Option<usize> {
         if PROFILING_ACTIVE.load() {
             let mut profile_items = self.profile_items.borrow_mut();
@@ -1268,7 +1272,12 @@ fn print_profile(items: &[ProfileItem], out: &mut File) {
             )
             .as_bytes(),
         );
-        let _ = out.write_all(&wcs2string(&item.cmd));
+        let indentation_level = col_width + 1 + col_width + 1 + level + 1;
+        let indented_cmd = item.cmd.replace(
+            L!("\n"),
+            &(WString::from("\n") + &wstr::repeat(L!(" "), indentation_level)[..]),
+        );
+        let _ = out.write_all(&wcs2string(&indented_cmd));
         let _ = out.write_all(b"\n");
     }
 }

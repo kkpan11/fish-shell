@@ -19,7 +19,6 @@ use crate::wildcard::{ANY_CHAR, ANY_STRING, ANY_STRING_RECURSIVE};
 use crate::wutil::encoding::{mbrtowc, wcrtomb, zero_mbstate, AT_LEAST_MB_LEN_MAX};
 use crate::wutil::fish_iswalnum;
 use bitflags::bitflags;
-use core::slice;
 use libc::{EIO, O_WRONLY, SIGTTOU, SIG_IGN, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use once_cell::sync::OnceCell;
 use std::cell::{Cell, RefCell};
@@ -1184,15 +1183,12 @@ pub fn truncate_at_nul(input: &wstr) -> &wstr {
 }
 
 pub fn cstr2wcstring(input: &[u8]) -> WString {
-    let strlen = input.iter().position(|c| *c == b'\0').unwrap();
-    str2wcstring(&input[0..strlen])
+    let input = CStr::from_bytes_until_nul(input).unwrap().to_bytes();
+    str2wcstring(input)
 }
 
 pub(crate) fn charptr2wcstring(input: *const libc::c_char) -> WString {
-    let input: &[u8] = unsafe {
-        let strlen = libc::strlen(input);
-        slice::from_raw_parts(input.cast(), strlen)
-    };
+    let input: &[u8] = unsafe { CStr::from_ptr(input).to_bytes() };
     str2wcstring(input)
 }
 
@@ -1340,7 +1336,7 @@ fn can_be_encoded(wc: char) -> bool {
 /// Return the number of bytes read, or 0 on EOF, or an error.
 pub fn read_blocked(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
     loop {
-        let res = nix::unistd::read(fd, buf);
+        let res = nix::unistd::read(unsafe { BorrowedFd::borrow_raw(fd) }, buf);
         if let Err(nix::Error::EINTR) = res {
             continue;
         }
@@ -1563,11 +1559,13 @@ pub fn is_windows_subsystem_for_linux(v: WSL) -> bool {
     }
 
     let wsl = RESULT.get_or_init(|| {
-        let mut info: libc::utsname = unsafe { mem::zeroed() };
-        let release: &[u8] = unsafe {
-            libc::uname(&mut info);
-            std::mem::transmute(&info.release[..])
+        let release = unsafe {
+            let mut info = mem::MaybeUninit::uninit();
+            libc::uname(info.as_mut_ptr());
+            let info = info.assume_init();
+            info.release
         };
+        let release: &[u8] = unsafe { std::mem::transmute(&release[..]) };
 
         // Sample utsname.release under WSLv2, testing for something like `4.19.104-microsoft-standard`
         // or `5.10.16.3-microsoft-standard-WSL2`
@@ -1635,7 +1633,7 @@ pub fn fish_reserved_codepoint(c: char) -> bool {
 
 pub fn redirect_tty_output(in_signal_handler: bool) {
     unsafe {
-        let mut t: libc::termios = mem::zeroed();
+        let mut t = mem::MaybeUninit::uninit();
         let s = CStr::from_bytes_with_nul(b"/dev/null\0").unwrap();
         let fd = libc::open(s.as_ptr(), O_WRONLY);
         if in_signal_handler && fd == -1 {
@@ -1644,7 +1642,7 @@ pub fn redirect_tty_output(in_signal_handler: bool) {
             assert!(fd != -1, "Could not open /dev/null!");
         }
         for stdfd in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
-            if libc::tcgetattr(stdfd, &mut t) == -1 && errno::errno().0 == EIO {
+            if libc::tcgetattr(stdfd, t.as_mut_ptr()) == -1 && errno::errno().0 == EIO {
                 libc::dup2(fd, stdfd);
             }
         }

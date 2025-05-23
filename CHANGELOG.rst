@@ -1,6 +1,8 @@
 fish 4.1.0 (released ???)
 =========================
 
+.. ignore for 4.1: 10929 10940 10948 10955 10965 10975 10989 10990 10998 11028 11052 11055 11069 11071 11079 11092 11098 11104 11106 11110 11140 11146 11148 11150 11214 11218 11259 11288 11299 11328 11350 11373 11395 11417 11419  
+
 Notable improvements and fixes
 ------------------------------
 - Compound commands (``begin; echo 1; echo 2; end``) can now be now be abbreviated using braces (``{ echo1; echo 2 }``), like in other shells.
@@ -19,7 +21,7 @@ Notable improvements and fixes
 
 Deprecations and removed features
 ---------------------------------
-- Tokens like ``{ echo, echo }`` in command position are no longer interpreted as brace expansion but as compound command.
+- Tokens like ``{echo,echo}`` or ``{ echo, echo }`` in command position are no longer interpreted as brace expansion but as compound command.
 - Terminfo-style key names (``bind -k``) are no longer supported. They had been superseded by the native notation since 4.0,
   and currently they would map back to information from terminfo, which does not match what terminals would send with the kitty keyboard protocol (:issue:`11342`).
 - fish no longer reads the terminfo database, so its behavior is no longer affected by the :envvar:`TERM` environment variable (:issue:`11344`).
@@ -34,6 +36,8 @@ Deprecations and removed features
     To make the nearest-match logic use the 16 color palette instead, use ``set fish_term256 0``.
   - Inside macOS Terminal.app, fish makes an attempt to still use the palette colors.
     If that doesn't work, use ``set fish_term24bit 0``.
+- ``set_color --background=COLOR`` no longer implicitly activates bold mode.
+  To mitigate this change on existing installations that use a default theme, update your theme with ``fish_config theme choose`` or ``fish_config theme save``.
 
 Scripting improvements
 ----------------------
@@ -55,18 +59,19 @@ New or improved bindings
 - :kbd:`ctrl-z` (undo) after executing a command will restore the previous cursor position instead of placing the cursor at the end of the command line.
 - The OSC 133 prompt marking feature has learned about kitty's ``click_events=1`` flag, which allows moving fish's cursor by clicking.
 - :kbd:`ctrl-l` now pushes all text located above the prompt to the terminal's scrollback, before clearing and redrawing the screen (via a new special input function ``scrollback-push``).
-  This feature depends on the terminal advertising via XTGETTCAP support for the ``indn`` terminfo capability,
-  and on the terminal supporting Synchronized Output (which is currently used by fish to detect features).
-  If any is missing, the binding falls back to ``clear-screen``.
+  For compatibility with terminals that do not provide the scroll-forward command,
+  this is only enabled by default if the terminal advertises support for the ``indn`` capability via XTGETTCAP.
 - Bindings using shift with non-ASCII letters (such as :kbd:`ctrl-shift-ä`) are now supported.
   If there is any modifier other than shift, this is the recommended notation (as opposed to :kbd:`ctrl-Ä`).
 
 Completions
 ^^^^^^^^^^^
+- ``git`` completions now show the remote url as a description when completing remotes.
+- ``systemctl`` completions no longer print escape codes if ``SYSTEMD_COLORS`` is set (:issue:`11465`).
 
 Improved terminal support
 ^^^^^^^^^^^^^^^^^^^^^^^^^
-- Support for curly underlines in `fish_color_*` variables and :doc:`set_color <cmds/set_color>` (:issue:`10957`).
+- Support for double, curly, dotted and dashed underlines in `fish_color_*` variables and :doc:`set_color <cmds/set_color>` (:issue:`10957`).
 - Underlines can now be colored independent of text (:issue:`7619`).
 - New documentation page `Terminal Compatibility <terminal-compatibility.html>`_ (also accessible via ``man fish-terminal-compatibility``) lists required and optional terminal control sequences used by fish.
 

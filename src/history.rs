@@ -33,6 +33,7 @@ use std::{
     ffi::CString,
     fs::File,
     io::{BufRead, Read, Seek, SeekFrom, Write},
+    mem::MaybeUninit,
     num::NonZeroUsize,
     ops::ControlFlow,
     os::{fd::AsRawFd, unix::fs::MetadataExt},
@@ -41,13 +42,13 @@ use std::{
 };
 
 use bitflags::bitflags;
-use libc::{fchown, flock, LOCK_EX, LOCK_SH, LOCK_UN};
+use libc::{fchown, flock, EINTR, LOCK_EX, LOCK_SH, LOCK_UN};
 use lru::LruCache;
 use nix::{fcntl::OFlag, sys::stat::Mode};
 use rand::Rng;
 
 use crate::{
-    ast::{Ast, Node},
+    ast::{self, Kind, Node},
     common::{
         str2wcstring, unescape_string, valid_var_name, wcs2zstring, CancelChecker,
         UnescapeStringStyle,
@@ -1358,8 +1359,15 @@ impl HistoryImpl {
             return false;
         }
 
-        let start_time = SystemTime::now();
-        let retval = unsafe { flock(file.as_raw_fd(), lock_type) };
+        let (ok, start_time) = loop {
+            let start_time = SystemTime::now();
+            if unsafe { flock(file.as_raw_fd(), lock_type) } != -1 {
+                break (true, start_time);
+            }
+            if errno::errno().0 != EINTR {
+                break (false, start_time);
+            }
+        };
         if let Ok(duration) = start_time.elapsed() {
             if duration > Duration::from_millis(250) {
                 FLOG!(
@@ -1372,7 +1380,7 @@ impl HistoryImpl {
                 ABANDONED_LOCKING.store(true);
             }
         }
-        retval != -1
+        ok
     }
 
     /// Unlock a history file.
@@ -1443,9 +1451,9 @@ fn format_history_record(
     // This warns for musl, but the warning is useless to us - there is nothing we can or should do.
     #[allow(deprecated)]
     let seconds = seconds as libc::time_t;
-    let mut timestamp: libc::tm = unsafe { std::mem::zeroed() };
+    let mut timestamp = MaybeUninit::uninit();
     if let Some(show_time_format) = show_time_format.and_then(|s| CString::new(s).ok()) {
-        if !unsafe { libc::localtime_r(&seconds, &mut timestamp).is_null() } {
+        if !unsafe { libc::localtime_r(&seconds, timestamp.as_mut_ptr()).is_null() } {
             const max_tstamp_length: usize = 100;
             let mut timestamp_str = [0_u8; max_tstamp_length];
             use libc::strftime;
@@ -1454,7 +1462,7 @@ fn format_history_record(
                     &mut timestamp_str[0] as *mut u8 as *mut libc::c_char,
                     max_tstamp_length,
                     show_time_format.as_ptr(),
-                    &timestamp,
+                    timestamp.as_ptr(),
                 )
             } != 0
             {
@@ -1496,7 +1504,7 @@ fn should_import_bash_history_line(line: &wstr) -> bool {
         }
     }
 
-    if Ast::parse(line, ParseTreeFlags::empty(), None).errored() {
+    if ast::parse(line, ParseTreeFlags::empty(), None).errored() {
         return false;
     }
 
@@ -1581,16 +1589,16 @@ impl History {
 
         // Find all arguments that look like they could be file paths.
         let mut needs_sync_write = false;
-        let ast = Ast::parse(s, ParseTreeFlags::empty(), None);
+        let ast = ast::parse(s, ParseTreeFlags::empty(), None);
 
         let mut potential_paths = Vec::new();
         for node in ast.walk() {
-            if let Some(arg) = node.as_argument() {
+            if let Kind::Argument(arg) = node.kind() {
                 let potential_path = arg.source(s);
                 if string_could_be_path(potential_path) {
                     potential_paths.push(potential_path.to_owned());
                 }
-            } else if let Some(stmt) = node.as_decorated_statement() {
+            } else if let Kind::DecoratedStatement(stmt) = node.kind() {
                 // Hack hack hack - if the command is likely to trigger an exit, then don't do
                 // background file detection, because we won't be able to write it to our history file
                 // before we exit.
